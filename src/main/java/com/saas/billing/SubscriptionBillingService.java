@@ -1,5 +1,8 @@
 package com.saas.billing;
 
+import com.saas.billing.domain.BillingCommand;
+import com.saas.billing.domain.Money;
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
@@ -15,46 +18,74 @@ public class SubscriptionBillingService {
     private static final String DB_USER = "admin";
     private static final String DB_PASS = "admin123";
 
-    public List<String> processMonthlyBilling(String customerId, String planType, double basePrice, 
-                                             String signupDateStr, int overdueDays, String promoCode, 
+    private static final BigDecimal LOYALTY_DISCOUNT_AFTER_24_MONTHS = new BigDecimal("0.15");
+    private static final BigDecimal LOYALTY_DISCOUNT_AFTER_12_MONTHS = new BigDecimal("0.10");
+    private static final BigDecimal NON_PROFIT_PRICE_FACTOR = new BigDecimal("0.70");
+    private static final Money BLACK_FRIDAY_DISCOUNT = Money.of("30.00");
+    private static final BigDecimal WELCOME10_PRICE_FACTOR = new BigDecimal("0.90");
+    private static final BigDecimal LATE_PAYMENT_PENALTY_RATE = new BigDecimal("0.02");
+    private static final BigDecimal DAILY_INTEREST_RATE = new BigDecimal("0.001");
+
+    /**
+     * Assinatura legada mantida para não quebrar os chamadores existentes.
+     *
+     * @deprecated use {@link #processMonthlyBilling(BillingCommand)}. O parâmetro {@code planType}
+     *     nunca foi utilizado e é ignorado.
+     */
+    @Deprecated
+    public List<String> processMonthlyBilling(String customerId, String planType, double basePrice,
+                                             String signupDateStr, int overdueDays, String promoCode,
                                              boolean isNonProfit, String paymentCardToken) {
+        return processMonthlyBilling(BillingCommand.builder()
+                .customerId(customerId)
+                .basePrice(Money.of(basePrice))
+                .signupDate(LocalDate.parse(signupDateStr))
+                .overdueDays(overdueDays)
+                .promoCode(promoCode)
+                .nonProfit(isNonProfit)
+                .paymentCardToken(paymentCardToken)
+                .build());
+    }
+
+    public List<String> processMonthlyBilling(BillingCommand command) {
 
         List<String> logs = new ArrayList<>();
-        
-        LocalDate signupDate = LocalDate.parse(signupDateStr);
+        String customerId = command.customerId();
+
+        LocalDate signupDate = command.signupDate();
         LocalDate today = LocalDate.now();
 
         int monthsActive = (today.getYear() - signupDate.getYear()) * 12 + (today.getMonthValue() - signupDate.getMonthValue());
 
-        double calculatedPrice = basePrice;
+        Money basePrice = command.basePrice();
+        Money calculatedPrice = basePrice;
 
         if (monthsActive > 24) {
-            calculatedPrice = calculatedPrice - (basePrice * 0.15); // 15% após 2 anos
+            calculatedPrice = calculatedPrice.minus(basePrice.times(LOYALTY_DISCOUNT_AFTER_24_MONTHS));
         } else if (monthsActive > 12) {
-            calculatedPrice = calculatedPrice - (basePrice * 0.10); // 10% após 1 ano
+            calculatedPrice = calculatedPrice.minus(basePrice.times(LOYALTY_DISCOUNT_AFTER_12_MONTHS));
         }
 
-        if (isNonProfit) {
-            calculatedPrice = calculatedPrice * 0.70; // 30% off para ONGs
+        if (command.nonProfit()) {
+            calculatedPrice = calculatedPrice.times(NON_PROFIT_PRICE_FACTOR);
         }
 
-        if (promoCode != null && !promoCode.trim().isEmpty()) {
+        if (command.hasPromoCode()) {
+            String promoCode = command.promoCode();
             if (promoCode.equalsIgnoreCase("BLACKFRIDAY") && today.getMonthValue() == 11) {
-                calculatedPrice = calculatedPrice - 30.0;
+                calculatedPrice = calculatedPrice.minus(BLACK_FRIDAY_DISCOUNT);
             } else if (promoCode.equalsIgnoreCase("WELCOME10") && monthsActive <= 1) {
-                calculatedPrice = calculatedPrice * 0.90;
+                calculatedPrice = calculatedPrice.times(WELCOME10_PRICE_FACTOR);
             }
         }
 
-        if (overdueDays > 0) {
-            double penalty = calculatedPrice * 0.02;
-            double dailyInterest = (calculatedPrice * 0.001) * overdueDays;
-            calculatedPrice = calculatedPrice + penalty + dailyInterest;
+        if (command.isOverdue()) {
+            Money penalty = calculatedPrice.times(LATE_PAYMENT_PENALTY_RATE);
+            Money dailyInterest = calculatedPrice.times(DAILY_INTEREST_RATE).times(command.overdueDays());
+            calculatedPrice = calculatedPrice.plus(penalty).plus(dailyInterest);
         }
 
-        if (calculatedPrice < 0) {
-            calculatedPrice = 0.0;
-        }
+        Money finalPrice = calculatedPrice.atLeastZero().rounded();
 
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASS)) {
             String sqlCustomer = "SELECT email, status FROM customers WHERE id = ?";
@@ -72,9 +103,10 @@ public class SubscriptionBillingService {
                 }
 
                 boolean paymentSuccess = false;
+                String paymentCardToken = command.paymentCardToken();
                 if (paymentCardToken != null && paymentCardToken.startsWith("tok_")) {
                     paymentSuccess = true;
-                    logs.add("Pagamento processado com sucesso: R$ " + calculatedPrice);
+                    logs.add("Pagamento processado com sucesso: R$ " + finalPrice);
                 } else {
                     logs.add("Falha no pagamento do cartão para: " + customerId);
                 }
@@ -82,7 +114,7 @@ public class SubscriptionBillingService {
                 String sqlInvoice = "INSERT INTO invoices(customer_id, amount, status, created_at) VALUES (?, ?, ?, NOW())";
                 PreparedStatement stmtInvoice = conn.prepareStatement(sqlInvoice);
                 stmtInvoice.setString(1, customerId);
-                stmtInvoice.setDouble(2, calculatedPrice);
+                stmtInvoice.setBigDecimal(2, finalPrice.toBigDecimal());
                 stmtInvoice.setString(3, paymentSuccess ? "PAID" : "FAILED");
                 stmtInvoice.executeUpdate();
 
@@ -91,7 +123,7 @@ public class SubscriptionBillingService {
                 emailSender.setSmtpPort(587);
                 emailSender.setFrom("billing@empresa.com");
                 emailSender.setSubject("Sua Fatura Mensal");
-                emailSender.setMsg("Olá! Sua fatura foi processada no valor de R$ " + calculatedPrice);
+                emailSender.setMsg("Olá! Sua fatura foi processada no valor de R$ " + finalPrice);
                 emailSender.addTo(email);
                 // emailSender.send();
 
