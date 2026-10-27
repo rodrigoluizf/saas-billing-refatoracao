@@ -6,35 +6,39 @@ import com.saas.billing.domain.Invoice;
 import com.saas.billing.domain.InvoiceStatus;
 import com.saas.billing.domain.Money;
 import com.saas.billing.domain.PaymentResult;
+import com.saas.billing.domain.PricingCalculator;
 import com.saas.billing.port.BillingInfrastructureException;
 import com.saas.billing.port.CustomerRepository;
 import com.saas.billing.port.InvoiceRepository;
 import com.saas.billing.port.NotificationService;
 import com.saas.billing.port.PaymentGateway;
-import java.math.BigDecimal;
+import java.lang.System.Logger.Level;
 import java.time.Clock;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
 
+/**
+ * Fachada de aplicação da cobrança mensal: orquestra precificação, pagamento, fatura e
+ * recibo. Não contém regra de preço (está em {@link PricingCalculator}) nem I/O concreto
+ * (está atrás das portas). A lista de mensagens retornada é a mesma do código legado.
+ */
 public class SubscriptionBillingService {
 
     private static final System.Logger LOGGER = System.getLogger(SubscriptionBillingService.class.getName());
 
-    private static final BigDecimal LOYALTY_DISCOUNT_AFTER_24_MONTHS = new BigDecimal("0.15");
-    private static final BigDecimal LOYALTY_DISCOUNT_AFTER_12_MONTHS = new BigDecimal("0.10");
-    private static final BigDecimal NON_PROFIT_PRICE_FACTOR = new BigDecimal("0.70");
-    private static final Money BLACK_FRIDAY_DISCOUNT = Money.of("30.00");
-    private static final BigDecimal WELCOME10_PRICE_FACTOR = new BigDecimal("0.90");
-    private static final BigDecimal LATE_PAYMENT_PENALTY_RATE = new BigDecimal("0.02");
-    private static final BigDecimal DAILY_INTEREST_RATE = new BigDecimal("0.001");
+    static final String INACTIVE_CUSTOMER = "Cliente inativo. Cobrança cancelada: ";
+    static final String PAYMENT_APPROVED = "Pagamento processado com sucesso: R$ ";
+    static final String PAYMENT_DECLINED = "Falha no pagamento do cartão para: ";
+    static final String RECEIPT_SENT = "E-mail disparado para: ";
+    static final String FATAL_ERROR = "Erro fatal no processamento: ";
 
     private final CustomerRepository customerRepository;
     private final InvoiceRepository invoiceRepository;
     private final PaymentGateway paymentGateway;
     private final NotificationService notificationService;
+    private final PricingCalculator pricingCalculator;
     private final Clock clock;
 
     public SubscriptionBillingService(CustomerRepository customerRepository,
@@ -42,10 +46,21 @@ public class SubscriptionBillingService {
                                       PaymentGateway paymentGateway,
                                       NotificationService notificationService,
                                       Clock clock) {
+        this(customerRepository, invoiceRepository, paymentGateway, notificationService,
+                new PricingCalculator(), clock);
+    }
+
+    public SubscriptionBillingService(CustomerRepository customerRepository,
+                                      InvoiceRepository invoiceRepository,
+                                      PaymentGateway paymentGateway,
+                                      NotificationService notificationService,
+                                      PricingCalculator pricingCalculator,
+                                      Clock clock) {
         this.customerRepository = Objects.requireNonNull(customerRepository);
         this.invoiceRepository = Objects.requireNonNull(invoiceRepository);
         this.paymentGateway = Objects.requireNonNull(paymentGateway);
         this.notificationService = Objects.requireNonNull(notificationService);
+        this.pricingCalculator = Objects.requireNonNull(pricingCalculator);
         this.clock = Objects.requireNonNull(clock);
     }
 
@@ -71,72 +86,27 @@ public class SubscriptionBillingService {
     }
 
     public List<String> processMonthlyBilling(BillingCommand command) {
-
+        Money amount = pricingCalculator.calculate(command, LocalDate.now(clock));
         List<String> logs = new ArrayList<>();
-        String customerId = command.customerId();
-
-        LocalDate signupDate = command.signupDate();
-        LocalDate today = LocalDate.now(clock);
-
-        int monthsActive = (today.getYear() - signupDate.getYear()) * 12 + (today.getMonthValue() - signupDate.getMonthValue());
-
-        Money basePrice = command.basePrice();
-        Money calculatedPrice = basePrice;
-
-        if (monthsActive > 24) {
-            calculatedPrice = calculatedPrice.minus(basePrice.times(LOYALTY_DISCOUNT_AFTER_24_MONTHS));
-        } else if (monthsActive > 12) {
-            calculatedPrice = calculatedPrice.minus(basePrice.times(LOYALTY_DISCOUNT_AFTER_12_MONTHS));
-        }
-
-        if (command.nonProfit()) {
-            calculatedPrice = calculatedPrice.times(NON_PROFIT_PRICE_FACTOR);
-        }
-
-        if (command.hasPromoCode()) {
-            String promoCode = command.promoCode();
-            if (promoCode.equalsIgnoreCase("BLACKFRIDAY") && today.getMonthValue() == 11) {
-                calculatedPrice = calculatedPrice.minus(BLACK_FRIDAY_DISCOUNT);
-            } else if (promoCode.equalsIgnoreCase("WELCOME10") && monthsActive <= 1) {
-                calculatedPrice = calculatedPrice.times(WELCOME10_PRICE_FACTOR);
-            }
-        }
-
-        if (command.isOverdue()) {
-            Money penalty = calculatedPrice.times(LATE_PAYMENT_PENALTY_RATE);
-            Money dailyInterest = calculatedPrice.times(DAILY_INTEREST_RATE).times(command.overdueDays());
-            calculatedPrice = calculatedPrice.plus(penalty).plus(dailyInterest);
-        }
-
-        Money finalPrice = calculatedPrice.atLeastZero().rounded();
-
         try {
-            Optional<Customer> found = customerRepository.findById(customerId);
-            if (found.isPresent()) {
-                Customer customer = found.get();
-
-                if (!customer.isActive()) {
-                    logs.add("Cliente inativo. Cobrança cancelada: " + customerId);
-                    return logs;
-                }
-
-                PaymentResult payment = paymentGateway.charge(command.paymentCardToken(), finalPrice);
-                if (payment.approved()) {
-                    logs.add("Pagamento processado com sucesso: R$ " + finalPrice);
-                } else {
-                    logs.add("Falha no pagamento do cartão para: " + customerId);
-                }
-
-                invoiceRepository.save(new Invoice(customerId, finalPrice, InvoiceStatus.from(payment)));
-
-                notificationService.sendInvoiceReceipt(customer.email(), finalPrice);
-                logs.add("E-mail disparado para: " + customer.email());
-            }
+            customerRepository.findById(command.customerId())
+                    .ifPresent(customer -> bill(customer, command, amount, logs));
         } catch (BillingInfrastructureException e) {
-            LOGGER.log(System.Logger.Level.ERROR, "Falha de infraestrutura na cobrança do cliente " + customerId, e);
-            logs.add("Erro fatal no processamento: " + e.getMessage());
+            LOGGER.log(Level.ERROR, "Falha de infraestrutura na cobrança do cliente " + command.customerId(), e);
+            logs.add(FATAL_ERROR + e.getMessage());
         }
-
         return logs;
+    }
+
+    private void bill(Customer customer, BillingCommand command, Money amount, List<String> logs) {
+        if (!customer.isActive()) {
+            logs.add(INACTIVE_CUSTOMER + command.customerId());
+            return;
+        }
+        PaymentResult payment = paymentGateway.charge(command.paymentCardToken(), amount);
+        logs.add(payment.approved() ? PAYMENT_APPROVED + amount : PAYMENT_DECLINED + command.customerId());
+        invoiceRepository.save(new Invoice(command.customerId(), amount, InvoiceStatus.from(payment)));
+        notificationService.sendInvoiceReceipt(customer.email(), amount);
+        logs.add(RECEIPT_SENT + customer.email());
     }
 }

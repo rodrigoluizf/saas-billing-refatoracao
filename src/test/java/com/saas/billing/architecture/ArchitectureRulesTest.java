@@ -60,6 +60,23 @@ public class ArchitectureRulesTest {
     }
 
     @Test
+    public void dominioEhPuroSemPortasNemRelogio() throws IOException {
+        List<String> violations = new ArrayList<>();
+        try (Stream<Path> walk = Files.walk(BASE.resolve("domain"))) {
+            for (Path file : walk.filter(p -> p.toString().endsWith(".java")).collect(Collectors.toList())) {
+                String source = Files.readString(file, StandardCharsets.UTF_8);
+                for (String forbidden : List.of("import com.saas.billing.port", "import java.time.Clock",
+                        "import java.net", "import java.io")) {
+                    if (source.contains(forbidden)) {
+                        violations.add(file + " contém '" + forbidden + "'");
+                    }
+                }
+            }
+        }
+        assertTrue("Domínio impuro:\n" + String.join("\n", violations), violations.isEmpty());
+    }
+
+    @Test
     public void nenhumCodigoDeProducaoTemCredenciaisFixas() throws IOException {
         try (Stream<Path> walk = Files.walk(BASE)) {
             List<Path> offenders = walk.filter(p -> p.toString().endsWith(".java"))
